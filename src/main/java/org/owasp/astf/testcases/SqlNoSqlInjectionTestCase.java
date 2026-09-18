@@ -57,6 +57,11 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
     private static final List<String> CREDENTIAL_FIELD_NAMES = List.of("password", "pass", "pwd");
     private static final List<String> AUTH_PATH_PATTERNS = List.of("login", "auth", "signin", "session");
 
+    // A deliberately bogus value used to establish a "this should fail" baseline for the
+    // generalized bypass check below — works for any field shape (credential, coupon code,
+    // discount token, ...), not just login-style username/password pairs.
+    private static final String NOSQL_BASELINE_INVALID_VALUE = "astf-nosql-invalid-baseline-000";
+
     // Matches an unresolved OpenAPI path template placeholder, e.g. "/{username}" — the literal
     // placeholder text, injected into directly rather than resolved to a real value first (unlike
     // BrokenObjectLevelAuthorizationTestCase's resolution, injection payloads don't need a real
@@ -95,17 +100,34 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
             "{\"$regex\": \".*\"}"
     );
 
+    // Operator payloads expressed as a plain JSON *string* rather than an object — found necessary
+    // by live-testing crAPI's apply_coupon endpoint: its DRF serializer declares coupon_code as a
+    // CharField, so the object-shaped payloads above never reach the query layer at all (rejected
+    // with a 400 before any injection point). A string-shaped payload passes that type check, and
+    // still targets any code path that builds a query/condition via raw string interpolation or a
+    // schema-less $where-style evaluation instead of a properly-typed query builder.
+    private static final List<String> NOSQL_STRING_OPERATOR_PAYLOADS = List.of(
+            "$ne",
+            "' || '1'=='1",
+            "'; return true; var x='",
+            "[$ne]=1"
+    );
+
     private static final List<String> NOSQL_ERROR_INDICATORS = List.of(
             "mongoerror", "bsonerror", "casterror", "e11000 duplicate key", "$where is not allowed",
             "mongoclient", "mongoose"
     );
 
     // Reused from the same class of false-positive fix as BrokenAuthenticationTestCase: a NoSQL
-    // auth-bypass attempt is only meaningful if the response doesn't ALSO carry an explicit
-    // failure signal despite a 2xx status (some APIs return 200 on both success and failure).
-    private static final List<String> AUTH_FAILURE_BODY_MARKERS = List.of(
+    // bypass attempt is only meaningful if the response doesn't ALSO carry an explicit failure
+    // signal despite a 2xx status (some APIs return 200 on both success and failure). Broadened
+    // beyond login-specific wording so the same check applies to any business-logic field (coupon
+    // codes, discount tokens, ...), not just credentials.
+    private static final List<String> FAILURE_BODY_MARKERS = List.of(
             "\"status\":\"fail\"", "\"success\":false", "incorrect", "invalid credentials",
-            "invalid username", "invalid password", "authentication failed", "unauthorized"
+            "invalid username", "invalid password", "authentication failed", "unauthorized",
+            "not found", "does not exist", "invalid", "expired", "already used", "already applied",
+            "denied", "rejected"
     );
 
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -385,8 +407,16 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
                                               List<String> fields, boolean isAuthLike) {
         List<Finding> findings = new ArrayList<>();
 
+        List<String> allPayloads = new ArrayList<>(NOSQL_OPERATOR_PAYLOADS.size() +
+                NOSQL_STRING_OPERATOR_PAYLOADS.size());
+        allPayloads.addAll(NOSQL_OPERATOR_PAYLOADS);
+        // String-shaped payloads need to be JSON string literals, not raw operator objects.
+        for (String stringPayload : NOSQL_STRING_OPERATOR_PAYLOADS) {
+            allPayloads.add("\"" + escapeJson(stringPayload) + "\"");
+        }
+
         for (String field : fields) {
-            for (String payload : NOSQL_OPERATOR_PAYLOADS) {
+            for (String payload : allPayloads) {
                 try {
                     String body = buildJsonBody(fields, field, payload);
                     HttpResponse response = sendRequest(endpoint, httpClient, body);
@@ -405,18 +435,34 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
                         }
                     }
 
-                    // Auth-bypass pattern: a credential-shaped field, on an auth-like endpoint,
-                    // accepting an operator payload (e.g. {"password": {"$ne": null}}) and
-                    // succeeding — the classic NoSQL login-bypass vulnerability class.
-                    boolean isCredentialField = CREDENTIAL_FIELD_NAMES.stream().anyMatch(field::equalsIgnoreCase);
-                    if (isAuthLike && isCredentialField && response.isSuccess()
-                            && AUTH_FAILURE_BODY_MARKERS.stream().noneMatch(lower::contains)) {
-                        findings.add(buildNoSqlFinding(endpoint, field, payload,
-                                "Authentication succeeded (HTTP " + response.getStatusCode() +
-                                ") when the '" + field + "' field was replaced with a MongoDB query operator " +
-                                "instead of a string value", Severity.CRITICAL,
-                                "NoSQL Injection — Authentication Bypass"));
-                        return findings;
+                    // Generalized bypass check: ANY field on ANY endpoint (not just a
+                    // credential-shaped field on an auth-like path — the original gating that
+                    // missed crAPI's coupon-code field entirely). A payload response is only a
+                    // real bypass signal if a baseline request using an obviously-invalid, but
+                    // ordinarily-typed, value on the SAME field would be expected to fail —
+                    // otherwise the endpoint may just accept (and ignore) any value.
+                    if (response.isSuccess() && FAILURE_BODY_MARKERS.stream().noneMatch(lower::contains)) {
+                        HttpResponse baseline = sendRequest(endpoint, httpClient,
+                                buildJsonBody(fields, field, "\"" + NOSQL_BASELINE_INVALID_VALUE + "\""));
+                        String baselineBody = baseline != null ? baseline.getBody() : null;
+                        boolean baselineFailed = baseline != null && baselineBody != null &&
+                                (!baseline.isSuccess() ||
+                                        FAILURE_BODY_MARKERS.stream().anyMatch(baselineBody.toLowerCase()::contains));
+
+                        if (baselineFailed) {
+                            boolean isCredentialField =
+                                    CREDENTIAL_FIELD_NAMES.stream().anyMatch(field::equalsIgnoreCase);
+                            String title = (isAuthLike && isCredentialField)
+                                    ? "NoSQL Injection — Authentication Bypass"
+                                    : "NoSQL Injection — Authorization/Logic Bypass";
+                            findings.add(buildNoSqlFinding(endpoint, field, payload,
+                                    "Request succeeded (HTTP " + response.getStatusCode() + ") when the '" +
+                                    field + "' field was replaced with a NoSQL query operator, while an " +
+                                    "ordinary invalid value on the same field failed (HTTP " +
+                                    (baseline != null ? baseline.getStatusCode() : "?") + ")", Severity.CRITICAL,
+                                    title));
+                            return findings;
+                        }
                     }
                 } catch (Exception e) {
                     logger.debug("Error testing NoSQL injection on {} field {}: {}", endpoint, field, e.getMessage());
