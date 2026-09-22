@@ -612,11 +612,12 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
     }
 
     /** Concatenates the text of every field named like {@link #MESSAGE_FIELD_NAMES}, anywhere in
-     *  the (possibly nested) JSON body, or {@code null} if the body isn't a JSON object at all. */
+     *  the (possibly nested) JSON body — object- or array-rooted, e.g. a batch-style response
+     *  like {@code [{"error": "..."}]} — or {@code null} if the body isn't parseable JSON at all. */
     private String extractMessageText(String responseBody) {
         try {
             JsonNode root = objectMapper.readTree(responseBody);
-            if (!root.isObject()) {
+            if (!root.isObject() && !root.isArray()) {
                 return null;
             }
             StringBuilder sb = new StringBuilder();

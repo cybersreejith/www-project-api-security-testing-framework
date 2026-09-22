@@ -269,6 +269,36 @@ class SqlNoSqlInjectionTestCaseTest {
     }
 
     @Test
+    @DisplayName("Extracts message-field text from an array-rooted response body too " +
+            "(regression: a top-level JSON array, e.g. a batch-style response, previously fell back " +
+            "to the old whole-body scan since message-field extraction bailed out before recursing " +
+            "into it)")
+    void testBypassNotMaskedByUnrelatedFailureWordInArrayRootedBody() throws IOException {
+        EndpointInfo endpoint = new EndpointInfo("/workshop/api/shop/apply_coupon", "POST", "application/json",
+                "{\"coupon_code\":\"WELCOME10\",\"amount\":10}", true);
+        endpoint.setBaseUrl("https://example.com");
+
+        // Baseline rejection is only signaled via a "message" field nested inside a top-level array.
+        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(), anyString()))
+                .thenReturn(new HttpResponse(200, "[{\"message\":\"Coupon not found\"}]", Map.of()));
+        // Success response's "message" field is clean, but an unrelated field happens to contain "invalid".
+        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(),
+                argThat(body -> body != null && body.contains("\"coupon_code\":\"$ne\""))))
+                .thenReturn(new HttpResponse(200, "[{\"message\":\"Coupon applied successfully\"," +
+                        "\"related_note\":\"invalid coupons expire after 30 days\"}]", Map.of()));
+        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(),
+                argThat(body -> body != null &&
+                        body.contains("\"coupon_code\":\"astf-nosql-invalid-baseline-000\""))))
+                .thenReturn(new HttpResponse(200, "[{\"message\":\"Coupon not found\"}]", Map.of()));
+
+        List<Finding> findings = testCase.execute(endpoint, httpClient);
+
+        assertFalse(findings.isEmpty(),
+                "Should still detect the bypass when the response body is array-rooted");
+        assertTrue(findings.stream().anyMatch(f -> f.getTitle().contains("Authorization/Logic Bypass")));
+    }
+
+    @Test
     @DisplayName("Sends the NoSQL baseline request at most once per field, even when every payload " +
             "succeeds for that field (regression: avoids multiplying live/side-effecting requests " +
             "against the target for every payload that happens to succeed)")
