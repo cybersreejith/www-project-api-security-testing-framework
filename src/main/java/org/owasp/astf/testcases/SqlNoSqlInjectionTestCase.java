@@ -106,11 +106,16 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
     // with a 400 before any injection point). A string-shaped payload passes that type check, and
     // still targets any code path that builds a query/condition via raw string interpolation or a
     // schema-less $where-style evaluation instead of a properly-typed query builder.
+    //
+    // Deliberately excludes bracket-notation key pollution (e.g. "field[$ne]=1"), which is a real
+    // NoSQL bypass technique but only against a form/query-string body parser (qs/body-parser)
+    // that expands "field[$ne]=1" into a nested {field: {$ne: 1}} object — a JSON request body has
+    // no such expansion step, so that payload sent as a plain string *value* here can't achieve
+    // what it's named for; it would just be a literal, inert string to any JSON-consuming backend.
     private static final List<String> NOSQL_STRING_OPERATOR_PAYLOADS = List.of(
             "$ne",
             "' || '1'=='1",
-            "'; return true; var x='",
-            "[$ne]=1"
+            "'; return true; var x='"
     );
 
     private static final List<String> NOSQL_ERROR_INDICATORS = List.of(
@@ -449,6 +454,14 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
             allPayloads.add("\"" + escapeJson(stringPayload) + "\"");
         }
 
+        // The baseline request only depends on the field being tested, not on which operator
+        // payload triggered the check — caching it here means at most one extra live request per
+        // field, instead of one per successful payload (up to allPayloads.size() of them). This
+        // matters because the endpoint under test may be a non-idempotent business action (e.g.
+        // applying a coupon), so re-sending an equivalent "baseline" request for every payload
+        // that happens to succeed would multiply real side effects against the target needlessly.
+        Map<String, HttpResponse> baselineResponseByField = new HashMap<>();
+
         for (String field : fields) {
             for (String payload : allPayloads) {
                 try {
@@ -476,9 +489,24 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
                     // ordinarily-typed, value on the SAME field would be expected to fail —
                     // otherwise the endpoint may just accept (and ignore) any value.
                     if (response.isSuccess() && !containsFailureMarker(responseBody)) {
-                        HttpResponse baseline = sendRequest(endpoint, httpClient,
-                                buildJsonBody(fields, fieldValues, field,
-                                        "\"" + NOSQL_BASELINE_INVALID_VALUE + "\""));
+                        HttpResponse baseline;
+                        if (baselineResponseByField.containsKey(field)) {
+                            baseline = baselineResponseByField.get(field);
+                        } else {
+                            // Isolated from the outer catch so a transient failure on this one
+                            // extra confirmation call doesn't get conflated with (and silently
+                            // discard evidence from) the payload request that already succeeded.
+                            try {
+                                baseline = sendRequest(endpoint, httpClient,
+                                        buildJsonBody(fields, fieldValues, field,
+                                                "\"" + NOSQL_BASELINE_INVALID_VALUE + "\""));
+                            } catch (Exception e) {
+                                logger.debug("Error sending NoSQL baseline request on {} field {}: {}",
+                                        endpoint, field, e.getMessage());
+                                baseline = null;
+                            }
+                            baselineResponseByField.put(field, baseline);
+                        }
                         String baselineBody = baseline != null ? baseline.getBody() : null;
                         boolean baselineFailed = baseline != null && baselineBody != null &&
                                 (!baseline.isSuccess() || containsFailureMarker(baselineBody));

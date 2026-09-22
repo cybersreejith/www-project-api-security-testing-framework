@@ -19,6 +19,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -265,6 +266,27 @@ class SqlNoSqlInjectionTestCaseTest {
         assertFalse(findings.isEmpty(),
                 "Unrelated 'invalid' text elsewhere in the body should not mask a real bypass");
         assertTrue(findings.stream().anyMatch(f -> f.getTitle().contains("Authorization/Logic Bypass")));
+    }
+
+    @Test
+    @DisplayName("Sends the NoSQL baseline request at most once per field, even when every payload " +
+            "succeeds for that field (regression: avoids multiplying live/side-effecting requests " +
+            "against the target for every payload that happens to succeed)")
+    void testNoSqlBaselineRequestCachedPerField() throws IOException {
+        EndpointInfo endpoint = new EndpointInfo("/api/search", "POST", "application/json",
+                "{\"query\":\"alice\"}", true);
+        endpoint.setBaseUrl("https://example.com");
+
+        // Every operator payload on "query" succeeds without a failure marker, and so does the
+        // baseline — so nothing short-circuits the loop, and every payload for the field gets
+        // tried. Without caching, that would mean one baseline call per payload.
+        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(), anyString()))
+                .thenReturn(new HttpResponse(200, "{\"results\":[]}", Map.of()));
+
+        testCase.execute(endpoint, httpClient);
+
+        verify(httpClient, times(1)).postWithStatus(anyString(), anyMap(), anyString(),
+                argThat(body -> body != null && body.contains("astf-nosql-invalid-baseline-000")));
     }
 
     @Test
