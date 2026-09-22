@@ -17,6 +17,9 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @DisplayName("SqlNoSqlInjectionTestCase unit tests")
@@ -217,30 +220,50 @@ class SqlNoSqlInjectionTestCaseTest {
     }
 
     @Test
-    @DisplayName("Detects a NoSQL/logic bypass on a non-credential, non-auth-path field " +
-            "(regression: crAPI's coupon-code field, TRACEABILITY.md row 12)")
-    void testDetectsNoSqlBypassOnCouponField() throws IOException {
+    @DisplayName("Preserves a numeric sibling field's real type instead of forcing it to a string " +
+            "(regression: a strict 'amount' integer validator would reject every request otherwise, " +
+            "masking any injection on the field actually under test)")
+    void testPreservesSiblingFieldOriginalType() throws IOException {
         EndpointInfo endpoint = new EndpointInfo("/workshop/api/shop/apply_coupon", "POST", "application/json",
                 "{\"coupon_code\":\"WELCOME10\",\"amount\":10}", true);
         endpoint.setBaseUrl("https://example.com");
 
-        // A string-shaped operator payload (survives a CharField/type check) succeeds...
-        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(),
-                argThat(body -> body != null && body.contains("$ne"))))
-                .thenReturn(new HttpResponse(200, "{\"message\":\"Coupon applied successfully\"}", Map.of()));
-        // ...while an ordinary invalid coupon code is rejected.
-        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(),
-                argThat(body -> body != null && body.contains("astf-nosql-invalid-baseline-000"))))
+        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(), anyString()))
                 .thenReturn(new HttpResponse(400, "{\"message\":\"Coupon not found\"}", Map.of()));
-        // Any other candidate payload (object-shaped, other string payloads) is rejected too.
+
+        testCase.execute(endpoint, httpClient);
+
+        verify(httpClient, atLeastOnce()).postWithStatus(anyString(), anyMap(), anyString(),
+                argThat(body -> body != null && body.contains("\"amount\":10")));
+        verify(httpClient, never()).postWithStatus(anyString(), anyMap(), anyString(),
+                argThat(body -> body != null && body.contains("\"amount\":\"test\"")));
+    }
+
+    @Test
+    @DisplayName("Detects a bypass even when an unrelated field's value contains a generic failure word " +
+            "(regression: scanning the whole body for words like 'invalid' previously risked masking a " +
+            "real bypass whenever unrelated response content happened to contain one)")
+    void testBypassNotMaskedByUnrelatedFailureWordInBody() throws IOException {
+        EndpointInfo endpoint = new EndpointInfo("/workshop/api/shop/apply_coupon", "POST", "application/json",
+                "{\"coupon_code\":\"WELCOME10\",\"amount\":10}", true);
+        endpoint.setBaseUrl("https://example.com");
+
+        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(), anyString()))
+                .thenReturn(new HttpResponse(400, "{\"message\":\"Coupon not found\"}", Map.of()));
+        // Success response's "message" field is clean, but an unrelated field happens to contain "invalid".
         when(httpClient.postWithStatus(anyString(), anyMap(), anyString(),
-                argThat(body -> body != null && !body.contains("$ne") &&
-                        !body.contains("astf-nosql-invalid-baseline-000"))))
+                argThat(body -> body != null && body.contains("\"coupon_code\":\"$ne\""))))
+                .thenReturn(new HttpResponse(200, "{\"message\":\"Coupon applied successfully\"," +
+                        "\"related_note\":\"invalid coupons expire after 30 days\"}", Map.of()));
+        when(httpClient.postWithStatus(anyString(), anyMap(), anyString(),
+                argThat(body -> body != null &&
+                        body.contains("\"coupon_code\":\"astf-nosql-invalid-baseline-000\""))))
                 .thenReturn(new HttpResponse(400, "{\"message\":\"Coupon not found\"}", Map.of()));
 
         List<Finding> findings = testCase.execute(endpoint, httpClient);
 
-        assertFalse(findings.isEmpty(), "Should detect the generalized NoSQL/logic bypass on the coupon field");
+        assertFalse(findings.isEmpty(),
+                "Unrelated 'invalid' text elsewhere in the body should not mask a real bypass");
         assertTrue(findings.stream().anyMatch(f -> f.getTitle().contains("Authorization/Logic Bypass")));
     }
 

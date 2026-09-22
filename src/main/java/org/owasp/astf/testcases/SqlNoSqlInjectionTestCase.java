@@ -5,7 +5,7 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -123,11 +123,33 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
     // signal despite a 2xx status (some APIs return 200 on both success and failure). Broadened
     // beyond login-specific wording so the same check applies to any business-logic field (coupon
     // codes, discount tokens, ...), not just credentials.
-    private static final List<String> FAILURE_BODY_MARKERS = List.of(
-            "\"status\":\"fail\"", "\"success\":false", "incorrect", "invalid credentials",
-            "invalid username", "invalid password", "authentication failed", "unauthorized",
-            "not found", "does not exist", "invalid", "expired", "already used", "already applied",
-            "denied", "rejected"
+    //
+    // Split into two tiers rather than one flat list scanned against the whole response body:
+    // unambiguous structured JSON key:value syntax (STRUCTURED_FAILURE_MARKERS) is safe to match
+    // anywhere in the body, but generic words (TEXT_FAILURE_MARKERS) like "invalid" or "expired"
+    // are common enough to appear in unrelated response content (a product name, an unrelated
+    // nested field, ...) that scanning the whole body for them risks a false negative — the
+    // generalized bypass check below would wrongly treat a genuine bypass as "failed" just because
+    // some unrelated part of the JSON happened to contain one of these words. TEXT_FAILURE_MARKERS
+    // is instead only checked against text pulled from fields that actually carry human-readable
+    // status text (see MESSAGE_FIELD_NAMES / containsFailureMarker), falling back to a whole-body
+    // scan only when the response isn't parseable JSON at all.
+    private static final List<String> STRUCTURED_FAILURE_MARKERS = List.of(
+            "\"status\":\"fail\"", "\"success\":false"
+    );
+
+    private static final List<String> TEXT_FAILURE_MARKERS = List.of(
+            "incorrect", "invalid credentials", "invalid username", "invalid password",
+            "authentication failed", "unauthorized", "not found", "does not exist", "invalid",
+            "expired", "already used", "already applied", "denied", "rejected"
+    );
+
+    // JSON field names that conventionally carry human-readable status/error text — the only
+    // place TEXT_FAILURE_MARKERS is checked against, to avoid matching those generic words inside
+    // unrelated field values (e.g. a "coupon_code" or "message" echoed straight from the request).
+    private static final List<String> MESSAGE_FIELD_NAMES = List.of(
+            "message", "error", "errors", "detail", "details", "reason", "description", "msg",
+            "status_message", "error_message"
     );
 
     private final ObjectMapper objectMapper = new ObjectMapper();
@@ -164,12 +186,13 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
             return findings;
         }
 
-        List<String> targetFields = extractBodyFieldNames(endpoint);
+        Map<String, JsonNode> fieldValues = extractBodyFieldValues(endpoint);
+        List<String> targetFields = new ArrayList<>(fieldValues.keySet());
         boolean isAuthLike = isAuthLikeEndpoint(endpoint);
 
-        findings.addAll(testSqlInjection(endpoint, httpClient, targetFields));
+        findings.addAll(testSqlInjection(endpoint, httpClient, targetFields, fieldValues));
         if (findings.isEmpty()) {
-            findings.addAll(testNoSqlInjection(endpoint, httpClient, targetFields, isAuthLike));
+            findings.addAll(testNoSqlInjection(endpoint, httpClient, targetFields, fieldValues, isAuthLike));
         }
         return findings;
     }
@@ -253,30 +276,38 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
     }
 
     /**
-     * Uses the endpoint's own discovered request body fields when available (more accurate —
-     * tests fields the API actually accepts), falling back to a common-name list otherwise.
+     * Uses the endpoint's own discovered request body fields and their original values when
+     * available (more accurate — tests fields the API actually accepts, and lets sibling fields
+     * keep their real JSON type), falling back to a common-name list with unknown types otherwise.
+     * <p>
+     * Preserving sibling fields' original types matters: {@link #buildJsonBody} previously forced
+     * every non-target field to the string {@code "test"} regardless of its real shape, so an
+     * endpoint with a strictly-typed sibling field (e.g. a numeric {@code amount} next to a
+     * {@code coupon_code} under test) would reject every request — payload and baseline alike —
+     * before the request ever reached the field actually being probed.
      */
-    private List<String> extractBodyFieldNames(EndpointInfo endpoint) {
+    private Map<String, JsonNode> extractBodyFieldValues(EndpointInfo endpoint) {
         String body = endpoint.getRequestBody();
         if (body != null && !body.isBlank()) {
             try {
                 JsonNode root = objectMapper.readTree(body);
-                if (root.isObject()) {
-                    List<String> fields = new ArrayList<>();
-                    Iterator<String> names = root.fieldNames();
-                    while (names.hasNext()) {
-                        fields.add(names.next());
+                if (root.isObject() && root.size() > 0) {
+                    Map<String, JsonNode> fields = new LinkedHashMap<>();
+                    for (Map.Entry<String, JsonNode> entry : root.properties()) {
+                        fields.put(entry.getKey(), entry.getValue());
                     }
-                    if (!fields.isEmpty()) {
-                        return fields;
-                    }
+                    return fields;
                 }
             } catch (Exception e) {
                 logger.debug("Could not parse request body fields for {}, using common field names: {}",
                         endpoint, e.getMessage());
             }
         }
-        return COMMON_BODY_FIELDS;
+        Map<String, JsonNode> fallback = new LinkedHashMap<>();
+        for (String field : COMMON_BODY_FIELDS) {
+            fallback.put(field, null); // unknown original type — buildJsonBody defaults to a string
+        }
+        return fallback;
     }
 
     private boolean isAuthLikeEndpoint(EndpointInfo endpoint) {
@@ -284,7 +315,8 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
         return AUTH_PATH_PATTERNS.stream().anyMatch(path::contains);
     }
 
-    private List<Finding> testSqlInjection(EndpointInfo endpoint, HttpClient httpClient, List<String> fields) {
+    private List<Finding> testSqlInjection(EndpointInfo endpoint, HttpClient httpClient, List<String> fields,
+                                            Map<String, JsonNode> fieldValues) {
         List<Finding> findings = new ArrayList<>();
 
         // Records each field's response to the bare single-quote payload (SQL_PAYLOADS.get(0)) as
@@ -295,7 +327,7 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
         for (String field : fields) {
             for (String payload : SQL_PAYLOADS) {
                 try {
-                    String body = buildJsonBody(fields, field, "\"" + escapeJson(payload) + "\"");
+                    String body = buildJsonBody(fields, fieldValues, field, "\"" + escapeJson(payload) + "\"");
                     HttpResponse response = sendRequest(endpoint, httpClient, body);
                     if (payload.equals(SQL_PAYLOADS.get(0))) {
                         quoteResponseByField.put(field, response);
@@ -335,7 +367,8 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
         }
 
         if (findings.isEmpty()) {
-            findings.addAll(testSqlInjectionBehavioral(endpoint, httpClient, fields, quoteResponseByField));
+            findings.addAll(testSqlInjectionBehavioral(endpoint, httpClient, fields, fieldValues,
+                    quoteResponseByField));
         }
 
         return findings;
@@ -357,13 +390,13 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
      * identical request — avoids doubling live HTTP calls, and any side effects, per field.
      */
     private List<Finding> testSqlInjectionBehavioral(EndpointInfo endpoint, HttpClient httpClient,
-                                                       List<String> fields,
+                                                       List<String> fields, Map<String, JsonNode> fieldValues,
                                                        Map<String, HttpResponse> quoteResponseByField) {
         List<Finding> findings = new ArrayList<>();
 
         for (String field : fields) {
             try {
-                String baselineBody = buildJsonBody(fields, field, "\"astf-baseline-value\"");
+                String baselineBody = buildJsonBody(fields, fieldValues, field, "\"astf-baseline-value\"");
                 HttpResponse baseline = sendRequest(endpoint, httpClient, baselineBody);
                 if (baseline == null || baseline.getStatusCode() == 500) {
                     continue; // baseline itself errors — can't attribute a later 500 to the payload
@@ -404,7 +437,8 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
     }
 
     private List<Finding> testNoSqlInjection(EndpointInfo endpoint, HttpClient httpClient,
-                                              List<String> fields, boolean isAuthLike) {
+                                              List<String> fields, Map<String, JsonNode> fieldValues,
+                                              boolean isAuthLike) {
         List<Finding> findings = new ArrayList<>();
 
         List<String> allPayloads = new ArrayList<>(NOSQL_OPERATOR_PAYLOADS.size() +
@@ -418,7 +452,7 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
         for (String field : fields) {
             for (String payload : allPayloads) {
                 try {
-                    String body = buildJsonBody(fields, field, payload);
+                    String body = buildJsonBody(fields, fieldValues, field, payload);
                     HttpResponse response = sendRequest(endpoint, httpClient, body);
                     String responseBody = response != null ? response.getBody() : null;
                     if (response == null || responseBody == null) {
@@ -441,13 +475,13 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
                     // real bypass signal if a baseline request using an obviously-invalid, but
                     // ordinarily-typed, value on the SAME field would be expected to fail —
                     // otherwise the endpoint may just accept (and ignore) any value.
-                    if (response.isSuccess() && FAILURE_BODY_MARKERS.stream().noneMatch(lower::contains)) {
+                    if (response.isSuccess() && !containsFailureMarker(responseBody)) {
                         HttpResponse baseline = sendRequest(endpoint, httpClient,
-                                buildJsonBody(fields, field, "\"" + NOSQL_BASELINE_INVALID_VALUE + "\""));
+                                buildJsonBody(fields, fieldValues, field,
+                                        "\"" + NOSQL_BASELINE_INVALID_VALUE + "\""));
                         String baselineBody = baseline != null ? baseline.getBody() : null;
                         boolean baselineFailed = baseline != null && baselineBody != null &&
-                                (!baseline.isSuccess() ||
-                                        FAILURE_BODY_MARKERS.stream().anyMatch(baselineBody.toLowerCase()::contains));
+                                (!baseline.isSuccess() || containsFailureMarker(baselineBody));
 
                         if (baselineFailed) {
                             boolean isCredentialField =
@@ -495,17 +529,90 @@ public class SqlNoSqlInjectionTestCase implements TestCase {
         return finding;
     }
 
-    /** Builds a JSON body with every known field set to a benign default, except {@code targetField}. */
-    private String buildJsonBody(List<String> allFields, String targetField, String rawValueJson) {
+    /**
+     * Builds a JSON body with {@code targetField} set to {@code rawValueJson} and every other
+     * known field set to its original value from {@code originalValues} when available (falling
+     * back to a benign {@code "test"} string when the original type is unknown — e.g. the
+     * {@code COMMON_BODY_FIELDS} fallback, which has no real request body to draw from).
+     * <p>
+     * Preserving sibling fields' real JSON type (rather than flattening every non-target field to
+     * a string) matters for strictly-typed APIs: a numeric field like {@code amount} sent as the
+     * string {@code "test"} can fail type validation on its own, rejecting the whole request
+     * before the field actually under test is ever evaluated — masking a real injection.
+     */
+    private String buildJsonBody(List<String> allFields, Map<String, JsonNode> originalValues,
+                                  String targetField, String rawValueJson) {
         StringBuilder sb = new StringBuilder("{");
         for (int i = 0; i < allFields.size(); i++) {
             if (i > 0) sb.append(",");
             String field = allFields.get(i);
             sb.append("\"").append(field).append("\":");
-            sb.append(field.equals(targetField) ? rawValueJson : "\"test\"");
+            if (field.equals(targetField)) {
+                sb.append(rawValueJson);
+            } else {
+                JsonNode original = originalValues.get(field);
+                sb.append(original != null ? original.toString() : "\"test\"");
+            }
         }
         sb.append("}");
         return sb.toString();
+    }
+
+    /**
+     * Whether {@code responseBody} carries an explicit failure/rejection signal, used to avoid
+     * treating a 2xx response that actually represents a business-logic failure as a real bypass.
+     * <p>
+     * {@link #STRUCTURED_FAILURE_MARKERS} (unambiguous JSON key:value syntax) is checked against
+     * the whole body. {@link #TEXT_FAILURE_MARKERS} (generic words like "invalid" or "expired")
+     * is checked only against text pulled from fields conventionally used for human-readable
+     * status/error messages ({@link #MESSAGE_FIELD_NAMES}) — scanning the whole body for words
+     * that common would risk a false negative if they happened to appear in unrelated content
+     * (e.g. a field simply echoing the submitted value back). Falls back to a whole-body scan only
+     * when the response isn't parseable JSON, so plain-text error responses are still covered.
+     */
+    private boolean containsFailureMarker(String responseBody) {
+        String lower = responseBody.toLowerCase();
+        if (STRUCTURED_FAILURE_MARKERS.stream().anyMatch(lower::contains)) {
+            return true;
+        }
+
+        String messageText = extractMessageText(responseBody);
+        if (messageText != null) {
+            return TEXT_FAILURE_MARKERS.stream().anyMatch(messageText.toLowerCase()::contains);
+        }
+        return TEXT_FAILURE_MARKERS.stream().anyMatch(lower::contains);
+    }
+
+    /** Concatenates the text of every field named like {@link #MESSAGE_FIELD_NAMES}, anywhere in
+     *  the (possibly nested) JSON body, or {@code null} if the body isn't a JSON object at all. */
+    private String extractMessageText(String responseBody) {
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            if (!root.isObject()) {
+                return null;
+            }
+            StringBuilder sb = new StringBuilder();
+            collectMessageText(root, sb);
+            return sb.length() > 0 ? sb.toString() : "";
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private void collectMessageText(JsonNode node, StringBuilder sb) {
+        if (node.isObject()) {
+            for (Map.Entry<String, JsonNode> entry : node.properties()) {
+                JsonNode value = entry.getValue();
+                if (MESSAGE_FIELD_NAMES.contains(entry.getKey().toLowerCase()) && value.isTextual()) {
+                    sb.append(value.asText()).append(' ');
+                }
+                collectMessageText(value, sb); // nested message fields, e.g. {"error": {"message": "..."}}
+            }
+        } else if (node.isArray()) {
+            for (JsonNode child : node) {
+                collectMessageText(child, sb);
+            }
+        }
     }
 
     private HttpResponse sendRequest(EndpointInfo endpoint, HttpClient httpClient, String body) throws IOException {
